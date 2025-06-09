@@ -1,5 +1,4 @@
 
-```python
 #!/usr/bin/env python3
 """
 Simple order test example demonstrating basic PyFIXTest usage.
