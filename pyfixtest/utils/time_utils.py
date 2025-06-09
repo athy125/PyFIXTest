@@ -3,7 +3,7 @@ Time utilities for FIX protocol timestamp handling.
 """
 
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional, Union
 
 
@@ -180,3 +180,113 @@ def is_market_hours(timestamp: Optional[str] = None) -> bool:
     market_close = parse_fix_time(get_market_close_time(dt))
     
     return market_open <= dt <= market_close
+
+def get_fix_utcdate() -> str:
+    """
+    Get current UTC date in FIX format (YYYYMMDD).
+    
+    Returns:
+        str: Current date in FIX format
+    """
+    return datetime.now(timezone.utc).strftime("%Y%m%d")
+
+
+def get_fix_utctime() -> str:
+    """
+    Get current UTC time in FIX format (HH:MM:SS).
+    
+    Returns:
+        str: Current time in FIX format
+    """
+    return datetime.now(timezone.utc).strftime("%H:%M:%S")
+
+
+def parse_fix_date(fix_date: str) -> datetime:
+    """
+    Parse FIX date string to datetime object.
+    
+    Args:
+        fix_date: FIX date string (YYYYMMDD)
+        
+    Returns:
+        datetime: Parsed date as datetime object
+    """
+    try:
+        return datetime.strptime(fix_date, "%Y%m%d").replace(tzinfo=timezone.utc)
+    except ValueError as e:
+        raise ValueError(f"Invalid FIX date format: {fix_date}") from e
+
+
+def format_fix_date(dt: datetime) -> str:
+    """
+    Format datetime object to FIX date format.
+    
+    Args:
+        dt: Datetime object to format
+        
+    Returns:
+        str: FIX formatted date (YYYYMMDD)
+    """
+    return dt.strftime("%Y%m%d")
+
+
+def get_business_days_between(start_date: str, end_date: str) -> int:
+    """
+    Calculate business days between two FIX dates.
+    
+    Args:
+        start_date: Start date in FIX format (YYYYMMDD)
+        end_date: End date in FIX format (YYYYMMDD)
+        
+    Returns:
+        int: Number of business days
+    """
+    start_dt = parse_fix_date(start_date)
+    end_dt = parse_fix_date(end_date)
+    
+    # Simple business day calculation (excludes weekends)
+    business_days = 0
+    current_date = start_dt
+    
+    while current_date <= end_dt:
+        if current_date.weekday() < 5:  # Monday = 0, Friday = 4
+            business_days += 1
+        current_date += timedelta(days=1)
+    
+    return business_days
+
+
+def is_weekend(fix_date: str) -> bool:
+    """
+    Check if FIX date falls on weekend.
+    
+    Args:
+        fix_date: Date in FIX format (YYYYMMDD)
+        
+    Returns:
+        bool: True if weekend
+    """
+    dt = parse_fix_date(fix_date)
+    return dt.weekday() >= 5  # Saturday = 5, Sunday = 6
+
+
+def add_business_days(fix_date: str, days: int) -> str:
+    """
+    Add business days to FIX date.
+    
+    Args:
+        fix_date: Starting date in FIX format
+        days: Number of business days to add
+        
+    Returns:
+        str: New date in FIX format
+    """
+    dt = parse_fix_date(fix_date)
+    added_days = 0
+    
+    while added_days < days:
+        dt += timedelta(days=1)
+        if dt.weekday() < 5:  # Skip weekends
+            added_days += 1
+    
+    return format_fix_date(dt)
