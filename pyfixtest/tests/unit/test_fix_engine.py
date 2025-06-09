@@ -1,779 +1,786 @@
 """
-Enhanced test configuration extensions for the FIX trading system.
+Unit tests for FIX Engine components.
 
-This module provides additional functionality for test configuration management,
-including test data generation, advanced mock behaviors, test result tracking,
-and enhanced validation capabilities.
+This module provides comprehensive unit tests for the FIX engine,
+including engine configuration, application handling, statistics tracking,
+and core engine functionality.
 """
 
-import asyncio
-import json
-import pickle
-import threading
+import unittest
 import time
-import random
-import statistics
-from concurrent.futures import ThreadPoolExecutor, Future
-from contextlib import contextmanager
-from typing import Dict, List, Optional, Any, Union, Callable, Iterator
-from dataclasses import dataclass, field
-from datetime import datetime, timezone, timedelta
-from pathlib import Path
-from enum import Enum
-from abc import ABC, abstractmethod
+import threading
+from unittest.mock import Mock, patch, MagicMock, call
+from datetime import datetime, timezone
+import tempfile
+import os
+import shutil
 
-from ..utils.logging_config import get_logger
+# Import the classes to test
+from pyfixtest.core.fix_engine import FIXEngine, SessionState
+from pyfixtest.config.fix_config import FIXConfig, SessionConfig, NetworkConfig, SecurityConfig, PerformanceConfig
+from pyfixtest.utils.logging_config import get_logger
 
-
-class TestDataType(Enum):
-    """Types of test data that can be generated."""
-    ORDER = "order"
-    EXECUTION = "execution"
-    MARKET_DATA = "market_data"
-    SECURITY_DEFINITION = "security_definition"
-    POSITION = "position"
-    ACCOUNT = "account"
-    TRADE_REPORT = "trade_report"
-    RISK_LIMIT = "risk_limit"
-
-
-@dataclass
-class TestDataSpec:
-    """Specification for generating test data."""
-    data_type: TestDataType
-    count: int = 100
-    start_date: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    end_date: datetime = field(default_factory=lambda: datetime.now(timezone.utc) + timedelta(days=1))
-    symbols: List[str] = field(default_factory=lambda: ["AAPL", "MSFT", "GOOGL"])
-    price_range: tuple = (50.0, 500.0)
-    quantity_range: tuple = (100, 10000)
-    randomization_seed: Optional[int] = None
-    custom_parameters: Dict[str, Any] = field(default_factory=dict)
+# Mock QuickFIX if not available
+try:
+    import quickfix as fix
+except ImportError:
+    # Create mock QuickFIX module for testing
+    fix = MagicMock()
+    fix.Application = object
+    fix.Message = MagicMock
+    fix.SessionID = MagicMock
+    fix.Session = MagicMock
+    fix.SocketInitiator = MagicMock
+    fix.SocketAcceptor = MagicMock
+    fix.FileStoreFactory = MagicMock
+    fix.FileLogFactory = MagicMock
+    fix.FieldNotFound = Exception
 
 
-class TestDataGenerator:
-    """Generates realistic test data for FIX testing scenarios."""
+class TestFIXEngine(unittest.TestCase):
+    """Test FIXEngine core functionality."""
     
-    def __init__(self, seed: Optional[int] = None):
-        """
-        Initialize test data generator.
+    def setUp(self):
+        """Set up test fixtures."""
+        self.temp_dir = tempfile.mkdtemp()
         
-        Args:
-            seed: Random seed for reproducible data generation
-        """
-        self.logger = get_logger(__name__)
-        self.random = random.Random(seed)
-        self.order_id_counter = 1
-        self.exec_id_counter = 1
-        self.trade_id_counter = 1
+        # Create test configuration
+        self.config = FIXConfig()
+        self.config.session.sender_comp_id = "TEST_SENDER"
+        self.config.session.target_comp_id = "TEST_TARGET"
+        self.config.session.begin_string = "FIX.4.4"
+        self.config.session.socket_connect_host = "localhost"
+        self.config.session.socket_connect_port = 9876
+        self.config.session.heartbeat_interval = 30
+        self.config.store_path = os.path.join(self.temp_dir, "store")
+        self.config.log_path = os.path.join(self.temp_dir, "logs")
         
-        # Market data state for realistic price movements
-        self.current_prices = {}
-        self.price_trends = {}
+        # Create directories
+        os.makedirs(self.config.store_path, exist_ok=True)
+        os.makedirs(self.config.log_path, exist_ok=True)
+        
+        self.engine = FIXEngine(self.config)
     
-    def generate_test_data(self, spec: TestDataSpec) -> List[Dict[str, Any]]:
-        """
-        Generate test data based on specification.
+    def tearDown(self):
+        """Clean up test fixtures."""
+        if hasattr(self, 'engine') and self.engine:
+            try:
+                self.engine.stop()
+            except:
+                pass
         
-        Args:
-            spec: Test data specification
-            
-        Returns:
-            List[Dict]: Generated test data
-        """
-        if spec.randomization_seed is not None:
-            self.random.seed(spec.randomization_seed)
-        
-        generators = {
-            TestDataType.ORDER: self._generate_orders,
-            TestDataType.EXECUTION: self._generate_executions,
-            TestDataType.MARKET_DATA: self._generate_market_data,
-            TestDataType.SECURITY_DEFINITION: self._generate_security_definitions,
-            TestDataType.POSITION: self._generate_positions,
-            TestDataType.ACCOUNT: self._generate_accounts,
-            TestDataType.TRADE_REPORT: self._generate_trade_reports,
-            TestDataType.RISK_LIMIT: self._generate_risk_limits
-        }
-        
-        generator = generators.get(spec.data_type)
-        if not generator:
-            raise ValueError(f"Unknown test data type: {spec.data_type}")
-        
-        return generator(spec)
-    
-    def _generate_orders(self, spec: TestDataSpec) -> List[Dict[str, Any]]:
-        """Generate test order data."""
-        orders = []
-        
-        for _ in range(spec.count):
-            symbol = self.random.choice(spec.symbols)
-            side = self.random.choice(['1', '2'])  # Buy/Sell
-            order_type = self.random.choice(['1', '2', '3', '4'])  # Market, Limit, Stop, Stop Limit
-            
-            price = self.random.uniform(*spec.price_range)
-            quantity = self.random.randint(*spec.quantity_range)
-            
-            order = {
-                'ClOrdID': f"TEST_ORDER_{self.order_id_counter:06d}",
-                'Symbol': symbol,
-                'Side': side,
-                'OrderQty': str(quantity),
-                'OrdType': order_type,
-                'TransactTime': self._random_timestamp(spec.start_date, spec.end_date),
-                'TimeInForce': self.random.choice(['0', '1', '3', '4']),  # DAY, GTC, IOC, FOK
-            }
-            
-            if order_type in ['2', '3', '4']:  # Orders that need price
-                order['Price'] = f"{price:.2f}"
-            
-            if order_type in ['3', '4']:  # Stop orders
-                order['StopPx'] = f"{price * self.random.uniform(0.95, 1.05):.2f}"
-            
-            # Add custom parameters
-            for key, value in spec.custom_parameters.items():
-                order[key] = value
-            
-            orders.append(order)
-            self.order_id_counter += 1
-        
-        return orders
-    
-    def _generate_executions(self, spec: TestDataSpec) -> List[Dict[str, Any]]:
-        """Generate test execution data."""
-        executions = []
-        
-        for _ in range(spec.count):
-            symbol = self.random.choice(spec.symbols)
-            side = self.random.choice(['1', '2'])
-            
-            price = self.random.uniform(*spec.price_range)
-            quantity = self.random.randint(*spec.quantity_range)
-            
-            execution = {
-                'ExecID': f"TEST_EXEC_{self.exec_id_counter:06d}",
-                'OrderID': f"TEST_ORDER_{self.random.randint(1, spec.count):06d}",
-                'ClOrdID': f"TEST_ORDER_{self.random.randint(1, spec.count):06d}",
-                'Symbol': symbol,
-                'Side': side,
-                'LastQty': str(quantity),
-                'LastPx': f"{price:.2f}",
-                'AvgPx': f"{price:.2f}",
-                'CumQty': str(quantity),
-                'LeavesQty': '0',
-                'ExecType': self.random.choice(['0', '1', '2', 'F']),  # New, Partial, Fill, Trade
-                'OrdStatus': self.random.choice(['0', '1', '2']),  # New, Partial, Filled
-                'TransactTime': self._random_timestamp(spec.start_date, spec.end_date),
-                'ExecTransType': '0',  # New
-            }
-            
-            executions.append(execution)
-            self.exec_id_counter += 1
-        
-        return executions
-    
-    def _generate_market_data(self, spec: TestDataSpec) -> List[Dict[str, Any]]:
-        """Generate test market data."""
-        market_data = []
-        
-        # Initialize current prices if not already done
-        for symbol in spec.symbols:
-            if symbol not in self.current_prices:
-                self.current_prices[symbol] = self.random.uniform(*spec.price_range)
-                self.price_trends[symbol] = self.random.choice([-1, 0, 1])
-        
-        time_delta = (spec.end_date - spec.start_date) / spec.count
-        
-        for i in range(spec.count):
-            for symbol in spec.symbols:
-                # Simulate realistic price movement
-                current_price = self.current_prices[symbol]
-                trend = self.price_trends[symbol]
-                
-                # Random walk with trend
-                change_percent = self.random.gauss(0, 0.01)  # 1% volatility
-                if trend != 0:
-                    change_percent += trend * 0.001  # Small trend bias
-                
-                new_price = current_price * (1 + change_percent)
-                new_price = max(new_price, spec.price_range[0])
-                new_price = min(new_price, spec.price_range[1])
-                
-                self.current_prices[symbol] = new_price
-                
-                # Occasionally change trend
-                if self.random.random() < 0.05:
-                    self.price_trends[symbol] = self.random.choice([-1, 0, 1])
-                
-                # Generate bid/ask around current price
-                spread = new_price * 0.001  # 0.1% spread
-                bid_price = new_price - spread / 2
-                ask_price = new_price + spread / 2
-                
-                bid_size = self.random.randint(100, 5000)
-                ask_size = self.random.randint(100, 5000)
-                
-                timestamp = spec.start_date + i * time_delta
-                
-                market_data.append({
-                    'Symbol': symbol,
-                    'MDEntryType': '0',  # Bid
-                    'MDEntryPx': f"{bid_price:.2f}",
-                    'MDEntrySize': str(bid_size),
-                    'MDEntryTime': timestamp.strftime('%H:%M:%S'),
-                    'MDEntryDate': timestamp.strftime('%Y%m%d'),
-                })
-                
-                market_data.append({
-                    'Symbol': symbol,
-                    'MDEntryType': '1',  # Ask
-                    'MDEntryPx': f"{ask_price:.2f}",
-                    'MDEntrySize': str(ask_size),
-                    'MDEntryTime': timestamp.strftime('%H:%M:%S'),
-                    'MDEntryDate': timestamp.strftime('%Y%m%d'),
-                })
-        
-        return market_data
-    
-    def _generate_security_definitions(self, spec: TestDataSpec) -> List[Dict[str, Any]]:
-        """Generate test security definition data."""
-        securities = []
-        
-        security_types = ['CS', 'PS', 'CD', 'WI', 'CB']  # Common stock, Preferred, etc.
-        currencies = ['USD', 'EUR', 'GBP', 'JPY', 'CAD']
-        exchanges = ['NASDAQ', 'NYSE', 'BATS', 'ARCA']
-        
-        for symbol in spec.symbols:
-            security = {
-                'Symbol': symbol,
-                'SecurityID': f"{symbol}_ID",
-                'SecurityIDSource': '8',  # Exchange Symbol
-                'SecurityType': self.random.choice(security_types),
-                'Currency': self.random.choice(currencies),
-                'SecurityExchange': self.random.choice(exchanges),
-                'SecurityDesc': f"{symbol} Common Stock",
-                'MaturityDate': '',
-                'IssueDate': '',
-                'SecuritySubType': '',
-                'Product': '1',  # Equity
-            }
-            
-            securities.append(security)
-        
-        return securities
-    
-    def _generate_positions(self, spec: TestDataSpec) -> List[Dict[str, Any]]:
-        """Generate test position data."""
-        positions = []
-        
-        accounts = [f"TEST_ACCOUNT_{i:03d}" for i in range(1, 11)]
-        
-        for symbol in spec.symbols:
-            for account in accounts:
-                if self.random.random() > 0.7:  # 30% chance of having position
-                    continue
-                
-                quantity = self.random.randint(-10000, 10000)
-                avg_price = self.random.uniform(*spec.price_range)
-                
-                position = {
-                    'Account': account,
-                    'Symbol': symbol,
-                    'LongQty': str(max(quantity, 0)),
-                    'ShortQty': str(abs(min(quantity, 0))),
-                    'PosQtyStatus': '0',  # Submitted
-                    'PosMaintRptID': f"POS_{account}_{symbol}",
-                    'PosReqResult': '0',  # Valid request
-                    'ClearingBusinessDate': datetime.now(timezone.utc).strftime('%Y%m%d'),
-                    'SettlPrice': f"{avg_price:.2f}",
-                }
-                
-                positions.append(position)
-        
-        return positions
-    
-    def _generate_accounts(self, spec: TestDataSpec) -> List[Dict[str, Any]]:
-        """Generate test account data."""
-        accounts = []
-        
-        for i in range(spec.count):
-            account = {
-                'Account': f"TEST_ACCOUNT_{i+1:03d}",
-                'CustomerOrFirm': '0',  # Customer
-                'AcctIDSource': '99',  # Other
-                'AccountType': self.random.choice(['1', '2', '3']),  # Individual, Corporate, etc.
-                'AccruedInterestAmt': f"{self.random.uniform(0, 1000):.2f}",
-                'AccruedInterestRate': f"{self.random.uniform(0, 0.1):.4f}",
-                'Commission': f"{self.random.uniform(0, 50):.2f}",
-                'Currency': 'USD',
-            }
-            
-            accounts.append(account)
-        
-        return accounts
-    
-    def _generate_trade_reports(self, spec: TestDataSpec) -> List[Dict[str, Any]]:
-        """Generate test trade report data."""
-        trade_reports = []
-        
-        for _ in range(spec.count):
-            symbol = self.random.choice(spec.symbols)
-            side = self.random.choice(['1', '2'])
-            
-            price = self.random.uniform(*spec.price_range)
-            quantity = self.random.randint(*spec.quantity_range)
-            
-            trade_report = {
-                'TradeReportID': f"TRADE_{self.trade_id_counter:06d}",
-                'TradeReportType': '0',  # Submit
-                'TrdType': self.random.choice(['0', '1', '2']),  # Regular, Block, EFP
-                'Symbol': symbol,
-                'Side': side,
-                'LastQty': str(quantity),
-                'LastPx': f"{price:.2f}",
-                'TradeDate': self._random_timestamp(spec.start_date, spec.end_date).strftime('%Y%m%d'),
-                'TransactTime': self._random_timestamp(spec.start_date, spec.end_date),
-                'PreviouslyReported': 'N',
-                'TrdMatchID': f"MATCH_{self.trade_id_counter:06d}",
-            }
-            
-            trade_reports.append(trade_report)
-            self.trade_id_counter += 1
-        
-        return trade_reports
-    
-    def _generate_risk_limits(self, spec: TestDataSpec) -> List[Dict[str, Any]]:
-        """Generate test risk limit data."""
-        risk_limits = []
-        
-        accounts = [f"TEST_ACCOUNT_{i:03d}" for i in range(1, 11)]
-        risk_types = ['1', '2', '3', '4']  # Position, Order, Net Position, etc.
-        
-        for account in accounts:
-            for symbol in spec.symbols:
-                for risk_type in risk_types:
-                    if self.random.random() > 0.5:  # 50% chance
-                        continue
-                    
-                    limit_amount = self.random.uniform(100000, 10000000)
-                    warning_level = limit_amount * 0.8
-                    
-                    risk_limit = {
-                        'RiskLimitReportID': f"RISK_{account}_{symbol}_{risk_type}",
-                        'RiskLimitRequestID': f"REQ_{account}_{symbol}_{risk_type}",
-                        'Account': account,
-                        'Symbol': symbol,
-                        'RiskLimitType': risk_type,
-                        'RiskLimitAmount': f"{limit_amount:.2f}",
-                        'RiskLimitCurrency': 'USD',
-                        'RiskLimitPlatform': 'TRADING_SYSTEM',
-                        'RiskLimitScope': '1',  # Firm level
-                        'RiskWarningLevel': f"{warning_level:.2f}",
-                    }
-                    
-                    risk_limits.append(risk_limit)
-        
-        return risk_limits
-    
-    def _random_timestamp(self, start_date: datetime, end_date: datetime) -> datetime:
-        """Generate random timestamp between start and end dates."""
-        delta = end_date - start_date
-        random_seconds = self.random.uniform(0, delta.total_seconds())
-        return start_date + timedelta(seconds=random_seconds)
-
-
-class TestMetrics:
-    """Tracks and manages test execution metrics."""
-    
-    def __init__(self):
-        """Initialize test metrics tracker."""
-        self.logger = get_logger(__name__)
-        self.metrics = {}
-        self.timers = {}
-        self.counters = {}
-        self.histograms = {}
-        self._lock = threading.Lock()
-    
-    def start_timer(self, name: str) -> float:
-        """
-        Start a named timer.
-        
-        Args:
-            name: Timer name
-            
-        Returns:
-            float: Start time
-        """
-        start_time = time.time()
-        with self._lock:
-            self.timers[name] = start_time
-        return start_time
-    
-    def stop_timer(self, name: str) -> float:
-        """
-        Stop a named timer and record duration.
-        
-        Args:
-            name: Timer name
-            
-        Returns:
-            float: Duration in seconds
-        """
-        end_time = time.time()
-        with self._lock:
-            if name not in self.timers:
-                self.logger.warning(f"Timer '{name}' was not started")
-                return 0.0
-            
-            duration = end_time - self.timers[name]
-            del self.timers[name]
-            
-            # Record in histogram
-            if name not in self.histograms:
-                self.histograms[name] = []
-            self.histograms[name].append(duration)
-            
-            return duration
-    
-    def increment_counter(self, name: str, value: int = 1):
-        """
-        Increment a named counter.
-        
-        Args:
-            name: Counter name
-            value: Increment value
-        """
-        with self._lock:
-            self.counters[name] = self.counters.get(name, 0) + value
-    
-    def record_value(self, name: str, value: float):
-        """
-        Record a metric value.
-        
-        Args:
-            name: Metric name
-            value: Metric value
-        """
-        with self._lock:
-            if name not in self.metrics:
-                self.metrics[name] = []
-            self.metrics[name].append(value)
-    
-    def get_counter(self, name: str) -> int:
-        """Get counter value."""
-        with self._lock:
-            return self.counters.get(name, 0)
-    
-    def get_timer_stats(self, name: str) -> Dict[str, float]:
-        """
-        Get timer statistics.
-        
-        Args:
-            name: Timer name
-            
-        Returns:
-            Dict: Timer statistics
-        """
-        with self._lock:
-            if name not in self.histograms or not self.histograms[name]:
-                return {}
-            
-            values = self.histograms[name]
-            return {
-                'count': len(values),
-                'min': min(values),
-                'max': max(values),
-                'mean': statistics.mean(values),
-                'median': statistics.median(values),
-                'p95': self._percentile(values, 95),
-                'p99': self._percentile(values, 99),
-                'std_dev': statistics.stdev(values) if len(values) > 1 else 0.0
-            }
-    
-    def get_metric_stats(self, name: str) -> Dict[str, float]:
-        """
-        Get metric statistics.
-        
-        Args:
-            name: Metric name
-            
-        Returns:
-            Dict: Metric statistics
-        """
-        with self._lock:
-            if name not in self.metrics or not self.metrics[name]:
-                return {}
-            
-            values = self.metrics[name]
-            return {
-                'count': len(values),
-                'min': min(values),
-                'max': max(values),
-                'mean': statistics.mean(values),
-                'median': statistics.median(values),
-                'sum': sum(values),
-                'std_dev': statistics.stdev(values) if len(values) > 1 else 0.0
-            }
-    
-    def get_all_stats(self) -> Dict[str, Any]:
-        """Get all metrics and statistics."""
-        with self._lock:
-            stats = {
-                'counters': self.counters.copy(),
-                'timers': {},
-                'metrics': {}
-            }
-            
-            for timer_name in self.histograms:
-                stats['timers'][timer_name] = self.get_timer_stats(timer_name)
-            
-            for metric_name in self.metrics:
-                stats['metrics'][metric_name] = self.get_metric_stats(metric_name)
-            
-            return stats
-    
-    def reset(self):
-        """Reset all metrics."""
-        with self._lock:
-            self.metrics.clear()
-            self.timers.clear()
-            self.counters.clear()
-            self.histograms.clear()
-    
-    def export_to_file(self, file_path: str, format: str = 'json'):
-        """
-        Export metrics to file.
-        
-        Args:
-            file_path: Output file path
-            format: Export format (json, csv)
-        """
-        stats = self.get_all_stats()
-        
-        if format.lower() == 'json':
-            with open(file_path, 'w') as f:
-                json.dump(stats, f, indent=2, default=str)
-        elif format.lower() == 'csv':
-            import csv
-            with open(file_path, 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(['Type', 'Name', 'Statistic', 'Value'])
-                
-                # Write counters
-                for name, value in stats['counters'].items():
-                    writer.writerow(['Counter', name, 'value', value])
-                
-                # Write timer stats
-                for name, timer_stats in stats['timers'].items():
-                    for stat, value in timer_stats.items():
-                        writer.writerow(['Timer', name, stat, value])
-                
-                # Write metric stats
-                for name, metric_stats in stats['metrics'].items():
-                    for stat, value in metric_stats.items():
-                        writer.writerow(['Metric', name, stat, value])
-        else:
-            raise ValueError(f"Unsupported export format: {format}")
-    
-    @staticmethod
-    def _percentile(values: List[float], percentile: float) -> float:
-        """Calculate percentile of values."""
-        if not values:
-            return 0.0
-        
-        sorted_values = sorted(values)
-        k = (len(sorted_values) - 1) * percentile / 100
-        f = int(k)
-        c = k - f
-        
-        if f == len(sorted_values) - 1:
-            return sorted_values[f]
-        
-        return sorted_values[f] * (1 - c) + sorted_values[f + 1] * c
-    
-    @contextmanager
-    def timer(self, name: str):
-        """Context manager for timing operations."""
-        self.start_timer(name)
+        # Clean up temp directory
         try:
-            yield
-        finally:
-            self.stop_timer(name)
+            shutil.rmtree(self.temp_dir)
+        except:
+            pass
+    
+    def test_engine_initialization(self):
+        """Test FIX engine initialization."""
+        self.assertIsNotNone(self.engine)
+        self.assertEqual(self.engine.config, self.config)
+        self.assertEqual(self.engine.state, SessionState.DISCONNECTED)
+        self.assertIsNone(self.engine.session_id)
+        self.assertIsNone(self.engine.application)
+        self.assertIsNone(self.engine.initiator)
+        self.assertIsNone(self.engine.acceptor)
+        self.assertIsInstance(self.engine.message_handlers, dict)
+        self.assertIsInstance(self.engine.received_messages, list)
+    
+    @patch('pyfixtest.core.fix_engine.fix.SocketInitiator')
+    @patch('pyfixtest.core.fix_engine.fix.FileLogFactory')
+    @patch('pyfixtest.core.fix_engine.fix.FileStoreFactory')
+    def test_start_initiator_success(self, mock_store_factory, mock_log_factory, mock_initiator):
+        """Test successful initiator startup."""
+        # Setup mocks
+        mock_initiator_instance = Mock()
+        mock_initiator.return_value = mock_initiator_instance
+        
+        # Test
+        result = self.engine.start_initiator()
+        
+        # Assertions
+        self.assertTrue(result)
+        self.assertEqual(self.engine.state, SessionState.CONNECTING)
+        self.assertIsNotNone(self.engine.application)
+        self.assertIsNotNone(self.engine.initiator)
+        mock_initiator_instance.start.assert_called_once()
+    
+    @patch('pyfixtest.core.fix_engine.fix.SocketInitiator')
+    def test_start_initiator_failure(self, mock_initiator):
+        """Test initiator startup failure."""
+        # Setup mock to raise exception
+        mock_initiator.side_effect = Exception("Connection failed")
+        
+        # Test
+        result = self.engine.start_initiator()
+        
+        # Assertions
+        self.assertFalse(result)
+        self.assertEqual(self.engine.state, SessionState.ERROR)
+    
+    @patch('pyfixtest.core.fix_engine.fix.SocketAcceptor')
+    @patch('pyfixtest.core.fix_engine.fix.FileLogFactory')
+    @patch('pyfixtest.core.fix_engine.fix.FileStoreFactory')
+    def test_start_acceptor_success(self, mock_store_factory, mock_log_factory, mock_acceptor):
+        """Test successful acceptor startup."""
+        # Setup mocks
+        mock_acceptor_instance = Mock()
+        mock_acceptor.return_value = mock_acceptor_instance
+        
+        # Test
+        result = self.engine.start_acceptor()
+        
+        # Assertions
+        self.assertTrue(result)
+        self.assertEqual(self.engine.state, SessionState.CONNECTING)
+        self.assertIsNotNone(self.engine.application)
+        self.assertIsNotNone(self.engine.acceptor)
+        mock_acceptor_instance.start.assert_called_once()
+    
+    @patch('pyfixtest.core.fix_engine.fix.SocketAcceptor')
+    def test_start_acceptor_failure(self, mock_acceptor):
+        """Test acceptor startup failure."""
+        # Setup mock to raise exception
+        mock_acceptor.side_effect = Exception("Accept failed")
+        
+        # Test
+        result = self.engine.start_acceptor()
+        
+        # Assertions
+        self.assertFalse(result)
+        self.assertEqual(self.engine.state, SessionState.ERROR)
+    
+    def test_stop_engine(self):
+        """Test engine stop functionality."""
+        # Setup mocks
+        self.engine.initiator = Mock()
+        self.engine.acceptor = Mock()
+        
+        # Test
+        self.engine.stop()
+        
+        # Assertions
+        self.engine.initiator.stop.assert_called_once()
+        self.engine.acceptor.stop.assert_called_once()
+        self.assertEqual(self.engine.state, SessionState.DISCONNECTED)
+        self.assertIsNone(self.engine.initiator)
+        self.assertIsNone(self.engine.acceptor)
+    
+    @patch('pyfixtest.core.fix_engine.fix.Session.sendToTarget')
+    def test_send_message_success(self, mock_send_to_target):
+        """Test successful message sending."""
+        # Setup
+        mock_message = Mock()
+        mock_session_id = Mock()
+        self.engine.session_id = mock_session_id
+        
+        # Test
+        result = self.engine.send_message(mock_message)
+        
+        # Assertions
+        self.assertTrue(result)
+        mock_send_to_target.assert_called_once_with(mock_message, mock_session_id)
+    
+    def test_send_message_no_session(self):
+        """Test message sending without active session."""
+        # Setup
+        mock_message = Mock()
+        self.engine.session_id = None
+        
+        # Test
+        result = self.engine.send_message(mock_message)
+        
+        # Assertions
+        self.assertFalse(result)
+    
+    @patch('pyfixtest.core.fix_engine.fix.Session.sendToTarget')
+    def test_send_message_exception(self, mock_send_to_target):
+        """Test message sending with exception."""
+        # Setup
+        mock_message = Mock()
+        mock_session_id = Mock()
+        self.engine.session_id = mock_session_id
+        mock_send_to_target.side_effect = Exception("Send failed")
+        
+        # Test
+        result = self.engine.send_message(mock_message)
+        
+        # Assertions
+        self.assertFalse(result)
+    
+    def test_wait_for_message_found(self):
+        """Test waiting for message that exists."""
+        # Setup
+        mock_message = Mock()
+        mock_header = Mock()
+        mock_header.getField.return_value = 'D'  # New Order Single
+        mock_message.getHeader.return_value = mock_header
+        
+        self.engine.received_messages = [mock_message]
+        
+        # Test
+        result = self.engine.wait_for_message('D', timeout=1.0)
+        
+        # Assertions
+        self.assertEqual(result, mock_message)
+        self.assertEqual(len(self.engine.received_messages), 0)  # Should be removed
+    
+    def test_wait_for_message_timeout(self):
+        """Test waiting for message with timeout."""
+        # Test
+        result = self.engine.wait_for_message('D', timeout=0.1)
+        
+        # Assertions
+        self.assertIsNone(result)
+    
+    def test_add_message_handler(self):
+        """Test adding message handler."""
+        # Setup
+        handler = Mock()
+        
+        # Test
+        self.engine.add_message_handler('D', handler)
+        
+        # Assertions
+        self.assertIn('D', self.engine.message_handlers)
+        self.assertIn(handler, self.engine.message_handlers['D'])
+    
+    def test_remove_message_handler(self):
+        """Test removing message handler."""
+        # Setup
+        handler = Mock()
+        self.engine.add_message_handler('D', handler)
+        
+        # Test
+        self.engine.remove_message_handler('D', handler)
+        
+        # Assertions
+        self.assertNotIn(handler, self.engine.message_handlers.get('D', []))
+    
+    def test_get_session_state(self):
+        """Test getting session state."""
+        # Test initial state
+        self.assertEqual(self.engine.get_session_state(), SessionState.DISCONNECTED)
+        
+        # Test state change
+        self.engine.state = SessionState.LOGGED_IN
+        self.assertEqual(self.engine.get_session_state(), SessionState.LOGGED_IN)
+    
+    def test_is_logged_in(self):
+        """Test logged in status check."""
+        # Test not logged in
+        self.assertFalse(self.engine.is_logged_in())
+        
+        # Test logged in
+        self.engine.state = SessionState.LOGGED_IN
+        self.assertTrue(self.engine.is_logged_in())
+    
+    def test_wait_for_login_success(self):
+        """Test waiting for login success."""
+        # Setup - simulate login after short delay
+        def delayed_login():
+            time.sleep(0.1)
+            self.engine.state = SessionState.LOGGED_IN
+        
+        login_thread = threading.Thread(target=delayed_login)
+        login_thread.start()
+        
+        # Test
+        result = self.engine.wait_for_login(timeout=1.0)
+        
+        # Cleanup
+        login_thread.join()
+        
+        # Assertions
+        self.assertTrue(result)
+    
+    def test_wait_for_login_timeout(self):
+        """Test waiting for login with timeout."""
+        # Test
+        result = self.engine.wait_for_login(timeout=0.1)
+        
+        # Assertions
+        self.assertFalse(result)
 
 
-class TestResultRecorder:
-    """Records and manages test execution results."""
+class TestFIXApplication(unittest.TestCase):
+    """Test FIXTestApplication functionality."""
     
-    def __init__(self, output_dir: str):
-        """
-        Initialize test result recorder.
+def setUp(self):
+        """Set up test fixtures."""
+        from pyfixtest.core.fix_engine import FIXTestApplication
         
-        Args:
-            output_dir: Directory for test result files
-        """
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.logger = get_logger(__name__)
+        self.engine = Mock()
+        self.engine.session_id = None
+        self.engine.state = SessionState.DISCONNECTED
+        self.engine.received_messages = []
+        self.engine.message_handlers = {}
+        self.engine._lock = threading.Lock()
         
-        self.test_results = []
-        self.test_session_id = str(uuid.uuid4())
-        self.session_start_time = datetime.now(timezone.utc)
-        
-        self._lock = threading.Lock()
+        self.application = FIXTestApplication(self.engine)
     
-    def record_test_start(self, test_name: str, test_type: str, metadata: Dict[str, Any] = None):
-        """
-        Record test start.
+def test_on_create(self):
+        """Test session creation callback."""
+        mock_session_id = Mock()
         
-        Args:
-            test_name: Name of the test
-            test_type: Type of test
-            metadata: Additional test metadata
-        """
-        with self._lock:
-            test_record = {
-                'test_name': test_name,
-                'test_type': test_type,
-                'session_id': self.test_session_id,
-                'start_time': datetime.now(timezone.utc),
-                'end_time': None,
-                'duration_seconds': None,
-                'status': 'RUNNING',
-                'result': None,
-                'error_message': None,
-                'metadata': metadata or {},
-                'metrics': {},
-                'artifacts': []
-            }
-            
-            self.test_results.append(test_record)
-            self.logger.info(f"Started test: {test_name} ({test_type})")
-            
-            return len(self.test_results) - 1  # Return index
+        # Test
+        self.application.onCreate(mock_session_id)
+        
+        # Assertions
+        self.assertEqual(self.engine.session_id, mock_session_id)
     
-    def record_test_end(self, test_index: int, status: str, result: Any = None, error_message: str = None, metrics: Dict[str, Any] = None):
-        """
-        Record test end.
+def test_on_logon(self):
+        """Test logon callback."""
+        mock_session_id = Mock()
         
-        Args:
-            test_index: Index of test record
-            status: Test status (PASSED, FAILED, SKIPPED, ERROR)
-            result: Test result data
-            error_message: Error message if failed
-            metrics: Test metrics
-        """
-        with self._lock:
-            if test_index >= len(self.test_results):
-                self.logger.error(f"Invalid test index: {test_index}")
-                return
-            
-            test_record = self.test_results[test_index]
-            end_time = datetime.now(timezone.utc)
-            
-            test_record.update({
-                'end_time': end_time,
-                'duration_seconds': (end_time - test_record['start_time']).total_seconds(),
-                'status': status,
-                'result': result,
-                'error_message': error_message,
-                'metrics': metrics or {}
-            })
-            
-            self.logger.info(f"Completed test: {test_record['test_name']} - {status}")
+        # Test
+        self.application.onLogon(mock_session_id)
+        
+        # Assertions
+        self.assertEqual(self.engine.state, SessionState.LOGGED_IN)
     
-    def add_test_artifact(self, test_index: int, artifact_path: str, artifact_type: str, description: str = ""):
-        """
-        Add test artifact.
+def test_on_logout(self):
+        """Test logout callback."""
+        mock_session_id = Mock()
         
-        Args:
-            test_index: Index of test record
-            artifact_path: Path to artifact file
-            artifact_type: Type of artifact (log, screenshot, data, etc.)
-            description: Artifact description
-        """
-        with self._lock:
-            if test_index >= len(self.test_results):
-                return
-            
-            artifact = {
-                'path': artifact_path,
-                'type': artifact_type,
-                'description': description,
-                'created_at': datetime.now(timezone.utc)
-            }
-            
-            self.test_results[test_index]['artifacts'].append(artifact)
+        # Test
+        self.application.onLogout(mock_session_id)
+        
+        # Assertions
+        self.assertEqual(self.engine.state, SessionState.LOGGED_OUT)
     
-    def generate_test_report(self, report_format: str = 'json') -> str:
-        """
-        Generate test execution report.
+def test_to_admin(self):
+        """Test admin message sending."""
+        mock_message = Mock()
+        mock_session_id = Mock()
         
-        Args:
-            report_format: Report format (json, html, xml)
-            
-        Returns:
-            str: Path to generated report
-        """
-        session_end_time = datetime.now(timezone.utc)
-        session_duration = (session_end_time - self.session_start_time).total_seconds()
-        
-        # Calculate summary statistics
-        total_tests = len(self.test_results)
-        passed_tests = sum(1 for t in self.test_results if t['status'] == 'PASSED')
-        failed_tests = sum(1 for t in self.test_results if t['status'] == 'FAILED')
-        error_tests = sum(1 for t in self.test_results if t['status'] == 'ERROR')
-        skipped_tests = sum(1 for t in self.test_results if t['status'] == 'SKIPPED')
-        
-        durations = [t['duration_seconds'] for t in self.test_results if t['duration_seconds'] is not None]
-        avg_duration = statistics.mean(durations) if durations else 0
-        
-        report_data = {
-            'session_id': self.test_session_id,
-            'session_start_time': self.session_start_time.isoformat(),
-            'session_end_time': session_end_time.isoformat(),
-            'session_duration_seconds': session_duration,
-            'summary': {
-                'total_tests': total_tests,
-                'passed_tests': passed_tests,
-                'failed_tests': failed_tests,
-                'error_tests': error_tests,
-                'skipped_tests': skipped_tests,
-                'success_rate': (passed_tests / total_tests * 100) if total_tests > 0 else 0,
-                'average_test_duration': avg_duration
-            },
-            'test_results': self.test_results
-        }
-        
-        if report_format.lower() == 'json':
-            report_file = self.output_dir / f"test_report_{self.test_session_id}.json"
-            with open(report_file, 'w') as f:
-                json.dump(report_data, f, indent=2, default=str)
-        
-        elif report_format.lower() == 'html':
-            report_file = self.output_dir / f"test_report_{self.test_session_id}.html"
-            html_content = self._generate_html_report(report_data)
-            with open(report_file, 'w') as f:
-                f.write(html_content)
-        
-        elif report_format.lower() == 'xml':
-            report_file = self.output_dir / f"test_report_{self.test_session_id}.xml"
-            xml_content = self._generate_xml_report(report_data)
-            with open(report_file, 'w') as f:
-                f.write(xml_content)
-        
-        else:
-            raise ValueError(f"Unsupported report format: {report_format}")
-        
-        self.logger.info(f"Generated test report: {report_file}")
-        return str(report_file)
+        # Test - should not raise exception
+        self.application.toAdmin(mock_message, mock_session_id)
     
-    def _generate_html_report(self, report_data: Dict[str, Any]) -> str:
-        """Generate HTML test report."""
-        html = f"""
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Test Execution Report</title>
-    <style>
-        body {{ font-family: Arial, sans-serif; margin: 20px; }}
-        .summary {{ background-color: #f0f0f0; padding: 15px; border-radius: 5px; }}
-        .passed {{ color: green; }}
+def test_from_admin(self):
+        """Test admin message receiving."""
+        mock_message = Mock()
+        mock_session_id = Mock()
+        
+        # Test - should not raise exception
+        self.application.fromAdmin(mock_message, mock_session_id)
+    
+def test_to_app(self):
+        """Test application message sending."""
+        mock_message = Mock()
+        mock_session_id = Mock()
+        
+        # Test - should not raise exception
+        self.application.toApp(mock_message, mock_session_id)
+    
+def test_from_app(self):
+        """Test application message receiving."""
+        # Setup
+        mock_message = Mock()
+        mock_session_id = Mock()
+        mock_header = Mock()
+        mock_header.getField.return_value = 'D'  # New Order Single
+        mock_message.getHeader.return_value = mock_header
+        
+        # Add message handler
+        handler = Mock()
+        self.engine.message_handlers['D'] = [handler]
+        
+        # Test
+        self.application.fromApp(mock_message, mock_session_id)
+        
+        # Assertions
+        self.assertIn(mock_message, self.engine.received_messages)
+        handler.assert_called_once_with(mock_message, mock_session_id)
+    
+def test_from_app_with_handler_exception(self):
+        """Test application message receiving with handler exception."""
+        # Setup
+        mock_message = Mock()
+        mock_session_id = Mock()
+        mock_header = Mock()
+        mock_header.getField.return_value = 'D'
+        mock_message.getHeader.return_value = mock_header
+        
+        # Add handler that raises exception
+        handler = Mock(side_effect=Exception("Handler error"))
+        self.engine.message_handlers['D'] = [handler]
+        
+        # Test - should not raise exception
+        self.application.fromApp(mock_message, mock_session_id)
+        
+        # Assertions
+        self.assertIn(mock_message, self.engine.received_messages)
+        handler.assert_called_once()
+
+
+class TestEngineConfiguration(unittest.TestCase):
+    """Test FIX engine configuration handling."""
+    
+    def setUp(self):
+        """Set up test fixtures."""
+        self.temp_dir = tempfile.mkdtemp()
+        self.config = FIXConfig()
+        self.config.store_path = os.path.join(self.temp_dir, "store")
+        self.config.log_path = os.path.join(self.temp_dir, "logs")
+        
+        # Create directories
+        os.makedirs(self.config.store_path, exist_ok=True)
+        os.makedirs(self.config.log_path, exist_ok=True)
+    
+    def tearDown(self):
+        """Clean up test fixtures."""
+        try:
+            shutil.rmtree(self.temp_dir)
+        except:
+            pass
+    
+    def test_configuration_defaults(self):
+        """Test default configuration values."""
+        config = FIXConfig()
+        
+        # Test session defaults
+        self.assertEqual(config.session.begin_string, "FIX.4.4")
+        self.assertEqual(config.session.heartbeat_interval, 30)
+        self.assertEqual(config.session.connection_type, "initiator")
+        
+        # Test network defaults
+        self.assertEqual(config.network.host, "localhost")
+        self.assertEqual(config.network.port, 9876)
+        self.assertEqual(config.network.connect_timeout, 30)
+        
+        # Test security defaults
+        self.assertFalse(config.security.ssl_enabled)
+        self.assertFalse(config.security.authentication_enabled)
+        
+        # Test performance defaults
+        self.assertEqual(config.performance.message_queue_size, 10000)
+        self.assertEqual(config.performance.worker_threads, 4)
+    
+    def test_session_config_to_dict(self):
+        """Test session configuration dictionary conversion."""
+        session_config = SessionConfig()
+        session_config.sender_comp_id = "TEST_SENDER"
+        session_config.target_comp_id = "TEST_TARGET"
+        session_config.heartbeat_interval = 30
+        
+        result = session_config.to_dict()
+        
+        self.assertEqual(result['SenderCompID'], "TEST_SENDER")
+        self.assertEqual(result['TargetCompID'], "TEST_TARGET")
+        self.assertEqual(result['HeartBtInt'], "30")
+    
+    def test_network_config_validation(self):
+        """Test network configuration validation."""
+        network_config = NetworkConfig()
+        
+        # Test valid configuration
+        network_config.port = 9876
+        network_config.connect_timeout = 30
+        network_config.max_connections = 100
+        network_config.min_connections = 1
+        
+        errors = network_config.validate()
+        self.assertEqual(len(errors), 0)
+        
+        # Test invalid port
+        network_config.port = 0
+        errors = network_config.validate()
+        self.assertIn("Port must be between 1 and 65535", errors)
+        
+        # Test invalid timeout
+        network_config.port = 9876
+        network_config.connect_timeout = -1
+        errors = network_config.validate()
+        self.assertIn("Connect timeout must be positive", errors)
+    
+    def test_security_config_validation(self):
+        """Test security configuration validation."""
+        security_config = SecurityConfig()
+        
+        # Test SSL enabled without certificate
+        security_config.ssl_enabled = True
+        errors = security_config.validate()
+        self.assertIn("SSL certificate file required when SSL is enabled", errors)
+        self.assertIn("SSL key file required when SSL is enabled", errors)
+        
+        # Test authentication enabled without credentials
+        security_config.ssl_enabled = False
+        security_config.authentication_enabled = True
+        errors = security_config.validate()
+        self.assertIn("Username required when authentication is enabled", errors)
+        self.assertIn("Password required when authentication is enabled", errors)
+    
+    def test_performance_config_validation(self):
+        """Test performance configuration validation."""
+        performance_config = PerformanceConfig()
+        
+        # Test valid configuration
+        errors = performance_config.validate()
+        self.assertEqual(len(errors), 0)
+        
+        # Test invalid queue size
+        performance_config.message_queue_size = 0
+        errors = performance_config.validate()
+        self.assertIn("Message queue size must be positive", errors)
+        
+        # Test invalid thread count
+        performance_config.message_queue_size = 1000
+        performance_config.worker_threads = 0
+        errors = performance_config.validate()
+        self.assertIn("Worker threads must be positive", errors)
+        
+        # Test invalid threshold
+        performance_config.worker_threads = 4
+        performance_config.cpu_threshold_percent = 150
+        errors = performance_config.validate()
+        self.assertIn("CPU threshold must be between 0 and 100", errors)
+    
+    @patch('pyfixtest.core.fix_engine.fix.SessionSettings')
+    def test_get_initiator_settings(self, mock_settings):
+        """Test generating initiator settings."""
+        # Setup
+        mock_settings_instance = Mock()
+        mock_settings.return_value = mock_settings_instance
+        
+        config = FIXConfig()
+        config.session.sender_comp_id = "TEST_SENDER"
+        config.session.target_comp_id = "TEST_TARGET"
+        config.session.socket_connect_host = "localhost"
+        config.session.socket_connect_port = 9876
+        
+        # Test
+        result = config.get_initiator_settings()
+        
+        # Assertions
+        self.assertEqual(result, mock_settings_instance)
+        mock_settings.assert_called_once()
+    
+    @patch('pyfixtest.core.fix_engine.fix.SessionSettings')
+    def test_get_acceptor_settings(self, mock_settings):
+        """Test generating acceptor settings."""
+        # Setup
+        mock_settings_instance = Mock()
+        mock_settings.return_value = mock_settings_instance
+        
+        config = FIXConfig()
+        config.session.sender_comp_id = "TEST_SENDER"
+        config.session.target_comp_id = "TEST_TARGET"
+        config.session.socket_accept_port = 9876
+        
+        # Test
+        result = config.get_acceptor_settings()
+        
+        # Assertions
+        self.assertEqual(result, mock_settings_instance)
+        mock_settings.assert_called_once()
+
+
+class TestEngineStatistics(unittest.TestCase):
+    """Test FIX engine statistics and monitoring."""
+    
+    def setUp(self):
+        """Set up test fixtures."""
+        self.temp_dir = tempfile.mkdtemp()
+        self.config = FIXConfig()
+        self.config.store_path = os.path.join(self.temp_dir, "store")
+        self.config.log_path = os.path.join(self.temp_dir, "logs")
+        
+        os.makedirs(self.config.store_path, exist_ok=True)
+        os.makedirs(self.config.log_path, exist_ok=True)
+        
+        self.engine = FIXEngine(self.config)
+    
+    def tearDown(self):
+        """Clean up test fixtures."""
+        if hasattr(self, 'engine') and self.engine:
+            try:
+                self.engine.stop()
+            except:
+                pass
+        
+        try:
+            shutil.rmtree(self.temp_dir)
+        except:
+            pass
+    
+    def test_message_handler_management(self):
+        """Test message handler registration and management."""
+        handler1 = Mock()
+        handler2 = Mock()
+        
+        # Test adding handlers
+        self.engine.add_message_handler('D', handler1)
+        self.engine.add_message_handler('D', handler2)
+        self.engine.add_message_handler('8', handler1)
+        
+        # Verify handlers added
+        self.assertEqual(len(self.engine.message_handlers['D']), 2)
+        self.assertEqual(len(self.engine.message_handlers['8']), 1)
+        
+        # Test removing handler
+        self.engine.remove_message_handler('D', handler1)
+        self.assertEqual(len(self.engine.message_handlers['D']), 1)
+        self.assertNotIn(handler1, self.engine.message_handlers['D'])
+        
+        # Test removing non-existent handler
+        self.engine.remove_message_handler('D', handler1)  # Should not error
+        self.assertEqual(len(self.engine.message_handlers['D']), 1)
+    
+    def test_received_messages_management(self):
+        """Test received messages storage and retrieval."""
+        # Initially empty
+        self.assertEqual(len(self.engine.received_messages), 0)
+        
+        # Add mock messages
+        mock_message1 = Mock()
+        mock_message2 = Mock()
+        
+        self.engine.received_messages.append(mock_message1)
+        self.engine.received_messages.append(mock_message2)
+        
+        self.assertEqual(len(self.engine.received_messages), 2)
+        self.assertIn(mock_message1, self.engine.received_messages)
+        self.assertIn(mock_message2, self.engine.received_messages)
+    
+    def test_thread_safety(self):
+        """Test thread safety of message operations."""
+        import threading
+        import time
+        
+        messages_added = []
+        handlers_added = []
+        
+        def add_messages():
+            for i in range(10):
+                mock_message = Mock()
+                mock_message.id = f"msg_{i}"
+                with self.engine._lock:
+                    self.engine.received_messages.append(mock_message)
+                    messages_added.append(mock_message)
+                time.sleep(0.001)
+        
+        def add_handlers():
+            for i in range(5):
+                handler = Mock()
+                handler.id = f"handler_{i}"
+                self.engine.add_message_handler(f"TYPE_{i}", handler)
+                handlers_added.append(handler)
+                time.sleep(0.001)
+        
+        # Run operations concurrently
+        thread1 = threading.Thread(target=add_messages)
+        thread2 = threading.Thread(target=add_handlers)
+        
+        thread1.start()
+        thread2.start()
+        
+        thread1.join()
+        thread2.join()
+        
+        # Verify results
+        self.assertEqual(len(self.engine.received_messages), 10)
+        self.assertEqual(len(handlers_added), 5)
+        
+        # Verify all handlers were added
+        for i, handler in enumerate(handlers_added):
+            self.assertIn(handler, self.engine.message_handlers[f"TYPE_{i}"])
+
+
+class TestEngineIntegration(unittest.TestCase):
+    """Integration tests for FIX engine components."""
+    
+    def setUp(self):
+        """Set up test fixtures."""
+        self.temp_dir = tempfile.mkdtemp()
+        self.config = FIXConfig()
+        self.config.session.sender_comp_id = "TEST_SENDER"
+        self.config.session.target_comp_id = "TEST_TARGET"
+        self.config.store_path = os.path.join(self.temp_dir, "store")
+        self.config.log_path = os.path.join(self.temp_dir, "logs")
+        
+        os.makedirs(self.config.store_path, exist_ok=True)
+        os.makedirs(self.config.log_path, exist_ok=True)
+    
+    def tearDown(self):
+        """Clean up test fixtures."""
+        try:
+            shutil.rmtree(self.temp_dir)
+        except:
+            pass
+    
+    def test_engine_configuration_integration(self):
+        """Test engine with different configurations."""
+        # Test with minimal configuration
+        minimal_config = FIXConfig()
+        engine = FIXEngine(minimal_config)
+        self.assertIsNotNone(engine)
+        
+        # Test with SSL configuration
+        ssl_config = FIXConfig()
+        ssl_config.security.ssl_enabled = True
+        ssl_config.security.ssl_cert_file = "/path/to/cert.pem"
+        ssl_config.security.ssl_key_file = "/path/to/key.pem"
+        ssl_config.store_path = self.config.store_path
+        ssl_config.log_path = self.config.log_path
+        
+        ssl_engine = FIXEngine(ssl_config)
+        self.assertIsNotNone(ssl_engine)
+        self.assertTrue(ssl_engine.config.security.ssl_enabled)
+        
+        # Test with authentication configuration
+        auth_config = FIXConfig()
+        auth_config.security.authentication_enabled = True
+        auth_config.security.username = "testuser"
+        auth_config.security.password = "testpass"
+        auth_config.store_path = self.config.store_path
+        auth_config.log_path = self.config.log_path
+        
+        auth_engine = FIXEngine(auth_config)
+        self.assertIsNotNone(auth_engine)
+        self.assertTrue(auth_engine.config.security.authentication_enabled)
+    
+    @patch('pyfixtest.core.fix_engine.fix.SocketInitiator')
+    @patch('pyfixtest.core.fix_engine.fix.FileLogFactory')
+    @patch('pyfixtest.core.fix_engine.fix.FileStoreFactory')
+    def test_full_initiator_lifecycle(self, mock_store_factory, mock_log_factory, mock_initiator):
+        """Test complete initiator lifecycle."""
+        # Setup mocks
+        mock_initiator_instance = Mock()
+        mock_initiator.return_value = mock_initiator_instance
+        
+        engine = FIXEngine(self.config)
+        
+        # Test startup
+        result = engine.start_initiator()
+        self.assertTrue(result)
+        self.assertEqual(engine.state, SessionState.CONNECTING)
+        
+        # Simulate login
+        engine.state = SessionState.LOGGED_IN
+        self.assertTrue(engine.is_logged_in())
+        
+        # Test message sending
+        mock_message = Mock()
+        mock_session_id = Mock()
+        engine.session_id = mock_session_id
+        
+        with patch('pyfixtest.core.fix_engine.fix.Session.sendToTarget') as mock_send:
+            result = engine.send_message(mock_message)
+            self.assertTrue(result)
+            mock_send.assert_called_once_with(mock_message, mock_session_id)
+        
+        # Test shutdown
+        engine.stop()
+        self.assertEqual(engine.state, SessionState.DISCONNECTED)
+        mock_initiator_instance.stop.assert_called_once()
+
+
+if __name__ == '__main__':
+    # Configure logging for tests
+    import logging
+    logging.getLogger().setLevel(logging.ERROR)  # Reduce noise during testing
+    
+    # Run tests
+    unittest.main(verbosity=2)
